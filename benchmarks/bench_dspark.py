@@ -20,6 +20,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from specforge.modeling.draft.dflash import extract_context_feature
 from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.utils import get_local_device
 
 
 @dataclass
@@ -70,11 +71,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_device(name: str) -> torch.device:
     if name != "auto":
         return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        return torch.device("npu")
-    return torch.device("cpu")
+    return get_local_device()
 
 
 def resolve_dtype(name: str) -> torch.dtype:
@@ -572,13 +569,13 @@ def main() -> None:
     )
     target_model = AutoModelForCausalLM.from_pretrained(
         args.target_model_path,
-        dtype=dtype,
+        torch_dtype=dtype,
         attn_implementation=args.attention_backend,
         trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
     draft_model = DSparkDraftModel.from_pretrained(
         args.draft_model_path,
-        dtype=dtype,
+        torch_dtype=dtype,
         attn_implementation=args.attention_backend,
         trust_remote_code=True,
     ).to(device).eval()
