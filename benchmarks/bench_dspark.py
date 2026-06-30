@@ -18,7 +18,6 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from specforge.data.preprocessing import preprocess_conversations
 from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.modeling.draft.dflash import extract_context_feature
 from specforge.modeling.draft.dspark import DSparkDraftModel
@@ -498,6 +497,41 @@ def question_to_prompt(question: dict[str, Any], benchmarker: Any) -> str:
     return "\n".join(str(value) for value in question.values())
 
 
+def render_jsonl_prompt(
+    row: dict[str, Any],
+    *,
+    tokenizer: Any,
+    template: Any,
+    is_preformatted: bool,
+) -> str:
+    if is_preformatted:
+        if "text" not in row:
+            raise ValueError(
+                f"Expected 'text' field for --is-preformatted, got keys: {list(row.keys())}"
+            )
+        text = str(row["text"])
+        assistant_header = template.assistant_header or ""
+        marker = text.rfind(assistant_header) if assistant_header else -1
+        if marker < 0:
+            end_marker = template.end_of_turn_token or ""
+            marker = text.rfind(end_marker) if end_marker else -1
+        return text[:marker] if marker >= 0 else text
+
+    if "conversations" not in row:
+        raise ValueError(f"Expected 'conversations' field, got keys: {list(row.keys())}")
+    messages = list(row["conversations"])
+    while messages and messages[-1].get("role") == "assistant":
+        messages.pop()
+    if template.system_prompt and messages and messages[0].get("role") != "system":
+        messages = [{"role": "system", "content": template.system_prompt}] + messages
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=getattr(template, "enable_thinking", False),
+    )
+
+
 def load_jsonl_prompts(
     path: str,
     *,
@@ -520,37 +554,19 @@ def load_jsonl_prompts(
 
     prompts = []
     for index, row in enumerate(rows):
-        if is_preformatted:
-            if "text" not in row:
-                raise ValueError(
-                    f"Expected 'text' field for --is-preformatted, got keys: {list(row.keys())}"
-                )
-            processed = preprocess_conversations(
-                tokenizer,
-                [row["text"]],
-                template,
-                max_length,
-                is_preformatted=True,
-            )
-        else:
-            if "conversations" not in row:
-                raise ValueError(
-                    f"Expected 'conversations' field, got keys: {list(row.keys())}"
-                )
-            tools = [row.get("tools", []) or []]
-            processed = preprocess_conversations(
-                tokenizer,
-                [row["conversations"]],
-                template,
-                max_length,
-                is_preformatted=False,
-                tools=tools,
-            )
-        if not processed["input_ids"]:
-            continue
-        input_ids = processed["input_ids"][0]
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
+        prompt_text = render_jsonl_prompt(
+            row,
+            tokenizer=tokenizer,
+            template=template,
+            is_preformatted=is_preformatted,
+        )
+        input_ids = tokenizer(
+            prompt_text,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).input_ids
         prompts.append(
             {
                 "prompt": row.get("id", f"{os.path.basename(path)}:{index}"),
