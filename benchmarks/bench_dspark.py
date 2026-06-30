@@ -497,6 +497,16 @@ def question_to_prompt(question: dict[str, Any], benchmarker: Any) -> str:
     return "\n".join(str(value) for value in question.values())
 
 
+def normalize_chat_message(message: dict[str, Any]) -> dict[str, Any]:
+    role = message.get("role", message.get("from", ""))
+    content = message.get("content") or message.get("value") or ""
+    if role in ("human", "user"):
+        role = "user"
+    elif role in ("gpt", "assistant"):
+        role = "assistant"
+    return {"role": role, "content": content}
+
+
 def render_jsonl_prompt(
     row: dict[str, Any],
     *,
@@ -519,9 +529,13 @@ def render_jsonl_prompt(
 
     if "conversations" not in row:
         raise ValueError(f"Expected 'conversations' field, got keys: {list(row.keys())}")
-    messages = list(row["conversations"])
+    messages = [normalize_chat_message(message) for message in row["conversations"]]
     while messages and messages[-1].get("role") == "assistant":
         messages.pop()
+    while messages and messages[0].get("role") not in ("system", "user"):
+        messages.pop(0)
+    if not any(message.get("role") == "user" for message in messages):
+        raise ValueError("No user message found in conversations.")
     if template.system_prompt and messages and messages[0].get("role") != "system":
         messages = [{"role": "system", "content": template.system_prompt}] + messages
     return tokenizer.apply_chat_template(
