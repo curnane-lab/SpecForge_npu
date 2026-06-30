@@ -18,6 +18,8 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+from specforge.data.preprocessing import preprocess_conversations
+from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.modeling.draft.dflash import extract_context_feature
 from specforge.modeling.draft.dspark import DSparkDraftModel
 from specforge.utils import get_local_device
@@ -51,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-model-path", required=True)
     parser.add_argument("--draft-model-path", required=True)
     parser.add_argument("--benchmark-list", nargs="*", default=[])
+    parser.add_argument("--eval-data-path", default=None)
+    parser.add_argument("--eval-data-limit", type=int, default=None)
+    parser.add_argument("--chat-template", default="qwen")
+    parser.add_argument("--is-preformatted", action="store_true")
+    parser.add_argument("--max-input-length", type=int, default=2048)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--prompts-file", default=None)
     parser.add_argument("--output-file", default=None)
@@ -487,7 +494,69 @@ def question_to_prompt(question: dict[str, Any], benchmarker: Any) -> str:
     return "\n".join(str(value) for value in question.values())
 
 
-def load_eval_sets(args: argparse.Namespace) -> list[tuple[str, list[str], Any, Any]]:
+def load_jsonl_prompts(
+    path: str,
+    *,
+    tokenizer: Any,
+    chat_template: str,
+    is_preformatted: bool,
+    max_length: int,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    template = TEMPLATE_REGISTRY.get(chat_template)
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+            if limit is not None and len(rows) >= limit:
+                break
+
+    prompts = []
+    for index, row in enumerate(rows):
+        if is_preformatted:
+            if "text" not in row:
+                raise ValueError(
+                    f"Expected 'text' field for --is-preformatted, got keys: {list(row.keys())}"
+                )
+            processed = preprocess_conversations(
+                tokenizer,
+                [row["text"]],
+                template,
+                max_length,
+                is_preformatted=True,
+            )
+        else:
+            if "conversations" not in row:
+                raise ValueError(
+                    f"Expected 'conversations' field, got keys: {list(row.keys())}"
+                )
+            tools = [row.get("tools", []) or []]
+            processed = preprocess_conversations(
+                tokenizer,
+                [row["conversations"]],
+                template,
+                max_length,
+                is_preformatted=False,
+                tools=tools,
+            )
+        if not processed["input_ids"]:
+            continue
+        input_ids = processed["input_ids"][0]
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        prompts.append(
+            {
+                "prompt": row.get("id", f"{os.path.basename(path)}:{index}"),
+                "input_ids": input_ids,
+            }
+        )
+    return prompts
+
+
+def load_eval_sets(args: argparse.Namespace, tokenizer: Any) -> list[tuple[str, list[Any], Any, Any]]:
     eval_sets = []
     if args.prompt:
         eval_sets.append(("prompt", [args.prompt], None, None))
@@ -495,6 +564,16 @@ def load_eval_sets(args: argparse.Namespace) -> list[tuple[str, list[str], Any, 
         with open(args.prompts_file, encoding="utf-8") as handle:
             prompts = [line.strip() for line in handle if line.strip()]
         eval_sets.append((os.path.basename(args.prompts_file), prompts, None, None))
+    if args.eval_data_path:
+        prompts = load_jsonl_prompts(
+            args.eval_data_path,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            is_preformatted=args.is_preformatted,
+            max_length=args.max_input_length,
+            limit=args.eval_data_limit,
+        )
+        eval_sets.append((os.path.basename(args.eval_data_path), prompts, None, None))
     for item in args.benchmark_list:
         from benchmarker import BENCHMARKS
 
@@ -505,7 +584,7 @@ def load_eval_sets(args: argparse.Namespace) -> list[tuple[str, list[str], Any, 
         prompts = [question_to_prompt(question, benchmarker) for question in questions]
         eval_sets.append((name, prompts, labels, benchmarker))
     if not eval_sets:
-        raise ValueError("Provide --prompt, --prompts-file, or --benchmark-list.")
+        raise ValueError("Provide --prompt, --prompts-file, --eval-data-path, or --benchmark-list.")
     return eval_sets
 
 
@@ -591,11 +670,16 @@ def main() -> None:
     )
 
     results = {"target_model": args.target_model_path, "draft_model": args.draft_model_path, "datasets": []}
-    for dataset_name, prompts, labels, benchmarker in load_eval_sets(args):
+    for dataset_name, prompts, labels, benchmarker in load_eval_sets(args, tokenizer):
         print(f"Running {dataset_name} with {len(prompts)} prompts")
         sample_rows = []
-        for index, prompt in enumerate(prompts, start=1):
-            input_ids = encode_prompt(tokenizer, prompt, args.apply_chat_template)
+        for index, prompt_item in enumerate(prompts, start=1):
+            if isinstance(prompt_item, dict):
+                prompt = str(prompt_item["prompt"])
+                input_ids = prompt_item["input_ids"]
+            else:
+                prompt = str(prompt_item)
+                input_ids = encode_prompt(tokenizer, prompt, args.apply_chat_template)
             metrics = generator.generate(input_ids, prompt)
             sample_rows.append(metrics)
             print(
