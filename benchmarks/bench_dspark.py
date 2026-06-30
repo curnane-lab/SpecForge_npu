@@ -189,17 +189,17 @@ class DSparkHFGenerator:
             device=target.device,
         )
         position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-        past_key_values_target = DynamicCache()
+        past_key_values_target = None
         past_key_values_draft = DynamicCache()
 
         initial = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
             use_cache=True,
             output_hidden_states=True,
             logits_to_keep=1,
         )
+        past_key_values_target = initial.past_key_values
         output_ids[:, :num_input_tokens] = input_ids
         first_token = sample_tokens(initial.logits, self.temperature)
         output_ids[:, num_input_tokens : num_input_tokens + 1] = first_token
@@ -238,6 +238,7 @@ class DSparkHFGenerator:
                 draft_token_count=draft_token_count,
                 block_size=block_size,
             )
+            past_key_values_target = verification["past_key_values_target"]
 
             accepted = verification["accepted_draft_tokens"]
             next_token = verification["next_token"]
@@ -252,14 +253,16 @@ class DSparkHFGenerator:
             if terminated_by_stop:
                 acceptance_lengths.append(accepted)
                 start += accepted
-                past_key_values_target.crop(start)
+                if past_key_values_target is not None:
+                    past_key_values_target.crop(start)
                 break
 
             output_ids[:, start + accepted + 1] = next_token
             new_token_ids = output_ids[:, start + 1 : start + accepted + 2]
             acceptance_lengths.append(accepted + 1)
             start += accepted + 1
-            past_key_values_target.crop(start)
+            if past_key_values_target is not None:
+                past_key_values_target.crop(start)
 
             target_hidden = extract_context_feature(
                 target_output.hidden_states, draft.target_layer_ids
@@ -385,7 +388,7 @@ class DSparkHFGenerator:
         verify_input_ids: torch.Tensor,
         draft_probs: torch.Tensor | None,
         position_ids: torch.Tensor,
-        past_key_values_target: DynamicCache,
+        past_key_values_target: Any,
         start: int,
         draft_token_count: int,
         block_size: int,
@@ -443,6 +446,7 @@ class DSparkHFGenerator:
 
         return {
             "target_output": target_output,
+            "past_key_values_target": target_output.past_key_values,
             "accepted_draft_tokens": accepted,
             "next_token": next_token,
             "effective_proposal_length": effective_proposal_length,
