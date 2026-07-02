@@ -253,8 +253,11 @@ class ConfidenceRecorder:
     def __init__(self, block_size: int, device: torch.device, num_bins: int = 20) -> None:
         self.block_size = int(block_size)
         self.num_bins = int(num_bins)
+        # NPU kernels do not support float64; use float32 on NPU to avoid
+        # implicit dtype casts that break scatter_add_.
+        self.dtype = torch.float32 if device.type == "npu" else torch.float64
         self.counts = torch.zeros(
-            (self.block_size, self.num_bins), dtype=torch.float64, device=device
+            (self.block_size, self.num_bins), dtype=self.dtype, device=device
         )
         self.pred_sums = torch.zeros_like(self.counts)
         self.target_sums = torch.zeros_like(self.counts)
@@ -269,14 +272,17 @@ class ConfidenceRecorder:
         if effective_length <= 0:
             return
         step_probs = torch.sigmoid(confidence_logits[:, :effective_length]).squeeze(0)
-        cumprod_pred = step_probs.cumprod(dim=0)
-        prefix_label = accept_prefix_mask[:, :effective_length].squeeze(0).to(torch.float64)
+        cumprod_pred = step_probs.cumprod(dim=0).to(self.dtype)
+        prefix_label = (
+            accept_prefix_mask[:, :effective_length].squeeze(0).to(self.dtype)
+        )
+        ones = torch.ones_like(cumprod_pred, dtype=self.dtype)
 
         bin_idx = (cumprod_pred * self.num_bins).long().clamp_(0, self.num_bins - 1)
         pos_idx = torch.arange(effective_length, device=cumprod_pred.device)
         flat = pos_idx * self.num_bins + bin_idx
 
-        self.counts.view(-1).scatter_add_(0, flat, torch.ones_like(cumprod_pred))
+        self.counts.view(-1).scatter_add_(0, flat, ones)
         self.pred_sums.view(-1).scatter_add_(0, flat, cumprod_pred)
         self.target_sums.view(-1).scatter_add_(0, flat, prefix_label)
 
