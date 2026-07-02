@@ -91,6 +91,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-list", nargs="*", default=[])
     parser.add_argument("--eval-data-path", default=None)
     parser.add_argument("--eval-data-limit", type=int, default=None)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Maximum number of prompts to evaluate per dataset. Applies to all "
+        "dataset sources after --eval-data-limit is applied.",
+    )
     parser.add_argument("--chat-template", default="qwen")
     parser.add_argument("--is-preformatted", action="store_true")
     parser.add_argument("--max-input-length", type=int, default=2048)
@@ -865,6 +872,13 @@ def load_eval_sets(args: argparse.Namespace, tokenizer: Any) -> list[tuple[str, 
         questions, labels = benchmarker.load_data()
         prompts = [question_to_prompt(question, benchmarker) for question in questions]
         eval_sets.append((name, prompts, labels, benchmarker))
+
+    if args.num_samples is not None:
+        eval_sets = [
+            (name, prompts[: args.num_samples], labels, benchmarker)
+            for name, prompts, labels, benchmarker in eval_sets
+        ]
+
     if not eval_sets:
         raise ValueError("Provide --prompt, --prompts-file, --eval-data-path, or --benchmark-list.")
     return eval_sets
