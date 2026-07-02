@@ -3,6 +3,10 @@
 
 This script evaluates a SpecForge-trained DSpark draft checkpoint directly, without
 converting it to DeepSpec format or launching an SGLang server.
+
+It can be run in single-process mode or under ``torchrun`` for multi-device
+distributed evaluation. When distributed, each rank processes a shard of the
+dataset and metrics are all-reduced before reporting.
 """
 
 from __future__ import annotations
@@ -12,15 +16,24 @@ import json
 import os
 import random
 import statistics
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.modeling.draft.dflash import extract_context_feature
 from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.sampling import (
+    gather_token_probs,
+    logits_to_probs,
+    sample_from_probs,
+    sample_residual,
+    sample_tokens,
+)
 from specforge.utils import get_local_device
 
 
@@ -34,6 +47,9 @@ class SampleMetrics:
     proposal_lengths: list[int]
     accepted_draft_lengths: list[int]
     acceptance_lengths: list[int]
+    total_time_sec: float
+    target_time_sec: float
+    draft_time_sec: float
 
 
 @dataclass
@@ -45,6 +61,27 @@ class DatasetMetrics:
     verify_rate: float
     accept_rates_by_position: list[float | None]
     accuracy: float | None = None
+    total_time_sec: float = 0.0
+    tokens_per_sec: float = 0.0
+    target_time_sec: float = 0.0
+    draft_time_sec: float = 0.0
+
+
+@dataclass
+class _DatasetAggregate:
+    """Raw counters used for distributed metric aggregation."""
+
+    sample_count: int
+    proposal_count: int
+    acceptance_length_sum: int
+    proposal_length_sum: int
+    proposals_at_pos: list[int]
+    accepted_at_pos: list[int]
+    output_token_sum: int
+    verify_count: int
+    total_time_sec: float
+    target_time_sec: float
+    draft_time_sec: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,7 +108,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--apply-chat-template", action="store_true")
+    parser.add_argument(
+        "--distributed-backend",
+        default=None,
+        choices=["nccl", "gloo", "hccl"],
+        help="Process-group backend for distributed evaluation. If omitted, the "
+        "backend is inferred from the device type (nccl for cuda, hccl for npu, "
+        "gloo otherwise).",
+    )
     return parser.parse_args()
+
+
+def _infer_backend(device_type: str) -> str:
+    if device_type == "cuda":
+        return "nccl"
+    if device_type == "npu":
+        return "hccl"
+    return "gloo"
+
+
+def init_distributed(
+    args_device: str, distributed_backend: str | None
+) -> tuple[torch.device, int, int]:
+    """Initialize torch.distributed when launched with torchrun.
+
+    Returns the local device, global rank and world size. In non-distributed
+    mode returns (device, 0, 1).
+    """
+    if not ("RANK" in os.environ and "WORLD_SIZE" in os.environ):
+        return resolve_device(args_device), 0, 1
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    # In distributed mode bind each process to its local rank device regardless
+    # of the --device argument, which is what torchrun expects.
+    if args_device != "auto" and not args_device.startswith(("cuda:", "npu:")):
+        device_type = torch.device(args_device).type
+    else:
+        device_type = resolve_device("auto").type
+
+    if device_type == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    elif device_type == "npu":
+        if not hasattr(torch, "npu"):
+            raise RuntimeError(
+                "NPU device requested but torch.npu is not available. "
+                "Install the Ascend PyTorch adapter to run on NPU."
+            )
+        torch.npu.set_device(local_rank)
+        device = torch.device("npu", local_rank)
+    else:
+        device = torch.device("cpu")
+
+    backend = distributed_backend or _infer_backend(device_type)
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
+    return device, rank, world_size
 
 
 def resolve_device(name: str) -> torch.device:
@@ -86,29 +182,6 @@ def resolve_dtype(name: str) -> torch.dtype:
         "float16": torch.float16,
         "float32": torch.float32,
     }[name]
-
-
-def sample_tokens(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    if temperature <= 1e-5:
-        return torch.argmax(logits, dim=-1)
-    probs = torch.softmax((logits / temperature).float(), dim=-1)
-    return torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).view(logits.shape[:-1])
-
-
-def logits_to_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    scale = max(float(temperature), 1e-5)
-    return torch.softmax((logits / scale).float(), dim=-1)
-
-
-def gather_token_probs(probs: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-    return probs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
-
-
-def sample_residual(target_probs: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
-    residual = (target_probs - draft_probs).clamp_min(0.0)
-    denom = residual.sum(dim=-1, keepdim=True)
-    probs = torch.where(denom > 1e-8, residual / denom.clamp_min(1e-8), target_probs)
-    return torch.multinomial(probs, 1).squeeze(-1)
 
 
 def trim_stop_tokens(
@@ -148,6 +221,109 @@ def resolve_stop_token_ids(target_model: Any, tokenizer: Any) -> list[int] | Non
     return result
 
 
+def assert_no_final_target_layer(target_model: Any, target_layer_ids: list[int]) -> None:
+    """Guard against using the final target decoder layer as a draft anchor.
+
+    ``output_hidden_states`` stores the final *normalized* hidden state at the
+    last layer, while target cache generation stores raw decoder-layer outputs.
+    Using the last layer as a target anchor causes a train/eval mismatch, so we
+    reject it early.
+    """
+    target_config = target_model.config
+    if hasattr(target_config, "text_config"):
+        target_config = target_config.text_config
+    last_layer_id = int(target_config.num_hidden_layers) - 1
+    target_layer_ids = [int(layer_id) for layer_id in target_layer_ids]
+    assert last_layer_id not in target_layer_ids, (
+        "target_layer_ids must not include the final target decoder layer "
+        f"{last_layer_id}. Use an earlier layer and regenerate the target cache "
+        "and draft checkpoint."
+    )
+
+
+class ConfidenceRecorder:
+    """Lightweight confidence-head calibration recorder.
+
+    When ``confidence_threshold == 0.0`` and the draft model has a confidence
+    head, this recorder collects per-position predicted prefix-acceptance
+    probabilities and observed acceptance outcomes. After the dataset finishes
+    it reports ECE-style calibration diagnostics.
+    """
+
+    def __init__(self, block_size: int, device: torch.device, num_bins: int = 20) -> None:
+        self.block_size = int(block_size)
+        self.num_bins = int(num_bins)
+        self.counts = torch.zeros(
+            (self.block_size, self.num_bins), dtype=torch.float64, device=device
+        )
+        self.pred_sums = torch.zeros_like(self.counts)
+        self.target_sums = torch.zeros_like(self.counts)
+
+    def observe(
+        self,
+        *,
+        confidence_logits: torch.Tensor,
+        accept_prefix_mask: torch.Tensor,
+        effective_length: int,
+    ) -> None:
+        if effective_length <= 0:
+            return
+        step_probs = torch.sigmoid(confidence_logits[:, :effective_length]).squeeze(0)
+        cumprod_pred = step_probs.cumprod(dim=0)
+        prefix_label = accept_prefix_mask[:, :effective_length].squeeze(0).to(torch.float64)
+
+        bin_idx = (cumprod_pred * self.num_bins).long().clamp_(0, self.num_bins - 1)
+        pos_idx = torch.arange(effective_length, device=cumprod_pred.device)
+        flat = pos_idx * self.num_bins + bin_idx
+
+        self.counts.view(-1).scatter_add_(0, flat, torch.ones_like(cumprod_pred))
+        self.pred_sums.view(-1).scatter_add_(0, flat, cumprod_pred)
+        self.target_sums.view(-1).scatter_add_(0, flat, prefix_label)
+
+    def reset(self) -> None:
+        self.counts.zero_()
+        self.pred_sums.zero_()
+        self.target_sums.zero_()
+
+    def all_reduce(self) -> None:
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        for tensor in (self.counts, self.pred_sums, self.target_sums):
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    def compute(self) -> list[dict[str, Any]]:
+        results = []
+        for pos in range(self.block_size):
+            counts = self.counts[pos]
+            total = float(counts.sum().item())
+            if total <= 1e-12:
+                results.append(
+                    {
+                        "position": pos,
+                        "total": 0.0,
+                        "ece": float("nan"),
+                        "mean_pred": float("nan"),
+                        "mean_target": float("nan"),
+                    }
+                )
+                continue
+            denom = counts.clamp_min(1e-12)
+            avg_pred = self.pred_sums[pos] / denom
+            avg_target = self.target_sums[pos] / denom
+            bin_err = (avg_pred - avg_target).abs()
+            ece = float((bin_err * counts).sum().item() / total)
+            results.append(
+                {
+                    "position": pos,
+                    "total": total,
+                    "ece": ece,
+                    "mean_pred": float(self.pred_sums[pos].sum().item()) / total,
+                    "mean_target": float(self.target_sums[pos].sum().item()) / total,
+                }
+            )
+        return results
+
+
 class DSparkHFGenerator:
     def __init__(
         self,
@@ -158,6 +334,7 @@ class DSparkHFGenerator:
         temperature: float,
         confidence_threshold: float,
         max_new_tokens: int,
+        confidence_recorder: ConfidenceRecorder | None = None,
     ):
         self.target_model = target_model
         self.draft_model = draft_model
@@ -170,6 +347,7 @@ class DSparkHFGenerator:
         if self.lm_head is None:
             self.lm_head = target_model.lm_head
         self.stop_token_ids = resolve_stop_token_ids(target_model, tokenizer)
+        self.confidence_recorder = confidence_recorder
 
     @torch.inference_mode()
     def generate(self, input_ids: torch.Tensor, prompt: str) -> SampleMetrics:
@@ -181,6 +359,10 @@ class DSparkHFGenerator:
         block_size = int(draft.block_size)
         mask_token_id = int(draft.mask_token_id)
 
+        total_start = time.perf_counter()
+        target_time = 0.0
+        draft_time = 0.0
+
         output_ids = torch.full(
             (1, max_length + block_size + 1),
             mask_token_id,
@@ -188,9 +370,9 @@ class DSparkHFGenerator:
             device=target.device,
         )
         position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
-        past_key_values_target = None
         past_key_values_draft = DynamicCache()
 
+        t0 = time.perf_counter()
         initial = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -198,6 +380,7 @@ class DSparkHFGenerator:
             output_hidden_states=True,
             logits_to_keep=1,
         )
+        target_time += time.perf_counter() - t0
         past_key_values_target = initial.past_key_values
         output_ids[:, :num_input_tokens] = input_ids
         first_token = sample_tokens(initial.logits, self.temperature)
@@ -210,7 +393,17 @@ class DSparkHFGenerator:
             output_ids = trim_stop_tokens(
                 output_ids[:, : num_input_tokens + 1], num_input_tokens, self.stop_token_ids
             )
-            return self._build_metrics(prompt, output_ids, num_input_tokens, [], [], [])
+            return self._build_metrics(
+                prompt,
+                output_ids,
+                num_input_tokens,
+                [],
+                [],
+                [],
+                total_time=time.perf_counter() - total_start,
+                target_time=target_time,
+                draft_time=draft_time,
+            )
 
         target_hidden = extract_context_feature(initial.hidden_states, draft.target_layer_ids)
         start = num_input_tokens
@@ -224,19 +417,20 @@ class DSparkHFGenerator:
                 block_size=block_size,
                 mask_token_id=mask_token_id,
             )
-            draft_token_count = proposal["draft_token_count"]
-            verify_input_ids = proposal["verify_input_ids"]
-            draft_probs = proposal["draft_probs"]
+            draft_time += proposal["draft_time_sec"]
 
+            t0 = time.perf_counter()
             verification = self._verify(
-                verify_input_ids=verify_input_ids,
-                draft_probs=draft_probs,
+                verify_input_ids=proposal["verify_input_ids"],
+                draft_probs=proposal["draft_probs"],
                 position_ids=position_ids,
                 past_key_values_target=past_key_values_target,
                 start=start,
-                draft_token_count=draft_token_count,
+                draft_token_count=proposal["draft_token_count"],
                 block_size=block_size,
+                confidence_logits=proposal["confidence_logits"],
             )
+            target_time += time.perf_counter() - t0
             past_key_values_target = verification["past_key_values_target"]
 
             accepted = verification["accepted_draft_tokens"]
@@ -244,10 +438,20 @@ class DSparkHFGenerator:
             terminated_by_stop = verification["terminated_by_stop"]
             target_output = verification["target_output"]
             effective_proposal_length = verification["effective_proposal_length"]
+            accept_prefix_mask = verification["accept_prefix_mask"]
+
+            if self.confidence_recorder is not None and proposal["confidence_logits"] is not None:
+                self.confidence_recorder.observe(
+                    confidence_logits=proposal["confidence_logits"],
+                    accept_prefix_mask=accept_prefix_mask,
+                    effective_length=effective_proposal_length,
+                )
 
             proposal_lengths.append(effective_proposal_length)
             accepted_draft_lengths.append(accepted)
-            output_ids[:, start : start + accepted + 1] = verify_input_ids[:, : accepted + 1]
+            output_ids[:, start : start + accepted + 1] = proposal["verify_input_ids"][
+                :, : accepted + 1
+            ]
 
             if terminated_by_stop:
                 acceptance_lengths.append(accepted)
@@ -278,6 +482,9 @@ class DSparkHFGenerator:
             proposal_lengths,
             accepted_draft_lengths,
             acceptance_lengths,
+            total_time=time.perf_counter() - total_start,
+            target_time=target_time,
+            draft_time=draft_time,
         )
 
     def _propose(
@@ -300,6 +507,8 @@ class DSparkHFGenerator:
         )
         draft_input_ids[:, 0] = output_ids[:, start]
         noise_embedding = self.embed_tokens(draft_input_ids).to(dtype=target_hidden.dtype)
+
+        t0 = time.perf_counter()
         block_hidden = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
@@ -311,6 +520,7 @@ class DSparkHFGenerator:
             is_causal=False,
         )[:, :block_size, :]
         past_key_values_draft.crop(start)
+        draft_time = time.perf_counter() - t0
 
         base_logits = self.lm_head(block_hidden)
         sampled_tokens, draft_logits = self._sample_dspark_block(
@@ -333,6 +543,8 @@ class DSparkHFGenerator:
                 "draft_token_count": 0,
                 "verify_input_ids": draft_input_ids[:, :1],
                 "draft_probs": None,
+                "confidence_logits": confidence_logits,
+                "draft_time_sec": draft_time,
             }
         return {
             "draft_token_count": proposal_len,
@@ -340,6 +552,8 @@ class DSparkHFGenerator:
                 [draft_input_ids[:, :1], sampled_tokens[:, :proposal_len]], dim=1
             ),
             "draft_probs": logits_to_probs(draft_logits[:, :proposal_len, :], self.temperature),
+            "confidence_logits": confidence_logits,
+            "draft_time_sec": draft_time,
         }
 
     def _sample_dspark_block(
@@ -391,6 +605,7 @@ class DSparkHFGenerator:
         start: int,
         draft_token_count: int,
         block_size: int,
+        confidence_logits: torch.Tensor | None,
     ) -> dict[str, Any]:
         verify_len = draft_token_count + 1
         target_output = self.target_model(
@@ -403,19 +618,21 @@ class DSparkHFGenerator:
         target_logits = target_output.logits
         target_probs = logits_to_probs(target_logits, self.temperature)
 
+        accept_prefix_mask = None
         accepted = 0
         if draft_token_count > 0:
             proposed = verify_input_ids[:, 1:]
-            if self.temperature <= 1e-5:
+            if self.temperature < 1e-5:
                 target_tokens = torch.argmax(target_logits[:, :-1, :], dim=-1)
-                accepted = int(((proposed == target_tokens).cumprod(dim=1)).sum(dim=1)[0].item())
+                accept_mask = (proposed == target_tokens).to(torch.int64)
             else:
                 assert draft_probs is not None
                 selected_target_probs = gather_token_probs(target_probs[:, :-1, :], proposed)
                 selected_draft_probs = gather_token_probs(draft_probs, proposed).clamp_min(1e-8)
                 accept_prob = torch.clamp(selected_target_probs / selected_draft_probs, max=1.0)
                 accept_mask = (torch.rand_like(accept_prob) < accept_prob).to(torch.int64)
-                accepted = int(accept_mask.cumprod(dim=1).sum(dim=1)[0].item())
+            accept_prefix_mask = accept_mask.cumprod(dim=1)
+            accepted = int(accept_prefix_mask.sum(dim=1)[0].item())
 
         effective_proposal_length = draft_token_count
         terminated_by_stop = False
@@ -431,21 +648,31 @@ class DSparkHFGenerator:
                 accepted = int(eos_hits[0].item()) + 1
                 effective_proposal_length = accepted
                 terminated_by_stop = True
+                if accept_prefix_mask is not None:
+                    accept_prefix_mask = accept_prefix_mask[:, :accepted]
 
         if 0 < draft_token_count and accepted < draft_token_count:
             assert draft_probs is not None
-            if self.temperature <= 1e-5:
+            if self.temperature < 1e-5:
                 next_token = torch.argmax(target_logits[:, accepted, :], dim=-1)
             else:
                 next_token = sample_residual(
                     target_probs[:, accepted, :], draft_probs[:, accepted, :]
                 )
         else:
-            next_token = sample_tokens(target_logits[:, -1:, :], self.temperature).squeeze(1)
+            next_token = sample_from_probs(target_probs[:, -1:, :]).squeeze(1)
+
+        if accept_prefix_mask is None:
+            accept_prefix_mask = torch.ones(
+                (verify_input_ids.size(0), max(accepted, 1)),
+                dtype=torch.int64,
+                device=verify_input_ids.device,
+            )
 
         return {
             "target_output": target_output,
             "past_key_values_target": target_output.past_key_values,
+            "accept_prefix_mask": accept_prefix_mask,
             "accepted_draft_tokens": accepted,
             "next_token": next_token,
             "effective_proposal_length": effective_proposal_length,
@@ -460,6 +687,9 @@ class DSparkHFGenerator:
         proposal_lengths: list[int],
         accepted_draft_lengths: list[int],
         acceptance_lengths: list[int],
+        total_time: float,
+        target_time: float,
+        draft_time: float,
     ) -> SampleMetrics:
         output_text = self.tokenizer.decode(
             output_ids[0, num_input_tokens:], skip_special_tokens=True
@@ -473,6 +703,9 @@ class DSparkHFGenerator:
             proposal_lengths=proposal_lengths,
             accepted_draft_lengths=accepted_draft_lengths,
             acceptance_lengths=acceptance_lengths,
+            total_time_sec=total_time,
+            target_time_sec=target_time,
+            draft_time_sec=draft_time,
         )
 
 
@@ -632,49 +865,198 @@ def encode_prompt(tokenizer: Any, prompt: str, apply_chat_template: bool) -> tor
     return tokenizer(prompt, return_tensors="pt").input_ids
 
 
+def _aggregate_samples(
+    samples: list[SampleMetrics],
+    block_size: int,
+) -> _DatasetAggregate:
+    proposal_lengths = [value for sample in samples for value in sample.proposal_lengths]
+    accepted_lengths = [value for sample in samples for value in sample.accepted_draft_lengths]
+    acceptance_lengths = [value for sample in samples for value in sample.acceptance_lengths]
+
+    proposals_at_pos = [0] * block_size
+    accepted_at_pos = [0] * block_size
+    for proposal_length, accepted_length in zip(proposal_lengths, accepted_lengths):
+        for pos in range(block_size):
+            if proposal_length > pos:
+                proposals_at_pos[pos] += 1
+            if accepted_length > pos:
+                accepted_at_pos[pos] += 1
+
+    return _DatasetAggregate(
+        sample_count=len(samples),
+        proposal_count=len(proposal_lengths),
+        acceptance_length_sum=sum(acceptance_lengths),
+        proposal_length_sum=sum(proposal_lengths),
+        proposals_at_pos=proposals_at_pos,
+        accepted_at_pos=accepted_at_pos,
+        output_token_sum=sum(sample.num_output_tokens for sample in samples),
+        verify_count=sum(sample.verify_count for sample in samples),
+        total_time_sec=sum(sample.total_time_sec for sample in samples),
+        target_time_sec=sum(sample.target_time_sec for sample in samples),
+        draft_time_sec=sum(sample.draft_time_sec for sample in samples),
+    )
+
+
+def _all_reduce_aggregate(aggregate: _DatasetAggregate, device: torch.device) -> _DatasetAggregate:
+    """All-reduce dataset counters across ranks in place."""
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return aggregate
+
+    scalar = torch.tensor(
+        [
+            aggregate.sample_count,
+            aggregate.proposal_count,
+            aggregate.acceptance_length_sum,
+            aggregate.proposal_length_sum,
+            aggregate.output_token_sum,
+            aggregate.verify_count,
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    float_scalar = torch.tensor(
+        [aggregate.total_time_sec, aggregate.target_time_sec, aggregate.draft_time_sec],
+        dtype=torch.float64,
+        device=device,
+    )
+    pos_counts = torch.tensor(
+        aggregate.proposals_at_pos + aggregate.accepted_at_pos,
+        dtype=torch.int64,
+        device=device,
+    )
+
+    dist.all_reduce(scalar, op=dist.ReduceOp.SUM)
+    dist.all_reduce(float_scalar, op=dist.ReduceOp.SUM)
+    dist.all_reduce(pos_counts, op=dist.ReduceOp.SUM)
+
+    block_size = len(aggregate.proposals_at_pos)
+    return _DatasetAggregate(
+        sample_count=int(scalar[0].item()),
+        proposal_count=int(scalar[1].item()),
+        acceptance_length_sum=int(scalar[2].item()),
+        proposal_length_sum=int(scalar[3].item()),
+        proposals_at_pos=[int(v) for v in pos_counts[:block_size].tolist()],
+        accepted_at_pos=[int(v) for v in pos_counts[block_size:].tolist()],
+        output_token_sum=int(scalar[4].item()),
+        verify_count=int(scalar[5].item()),
+        total_time_sec=float(float_scalar[0].item()),
+        target_time_sec=float(float_scalar[1].item()),
+        draft_time_sec=float(float_scalar[2].item()),
+    )
+
+
+def _build_dataset_metrics(
+    dataset: str,
+    aggregate: _DatasetAggregate,
+    block_size: int,
+    accuracy: float | None,
+) -> DatasetMetrics:
+    proposal_count = aggregate.proposal_count
+    if proposal_count == 0:
+        draft_tokens_per_proposal = 0.0
+        acceptance_length = 0.0
+        verify_rate = 0.0
+        accept_rates_by_position = [None] * block_size
+    else:
+        acceptance_length = aggregate.acceptance_length_sum / proposal_count
+        draft_tokens_per_proposal = aggregate.proposal_length_sum / proposal_count
+        verify_rate = aggregate.acceptance_length_sum / (
+            aggregate.proposal_length_sum + proposal_count
+        )
+        accept_rates_by_position = []
+        for pos in range(block_size):
+            denom = aggregate.proposals_at_pos[pos]
+            if denom == 0:
+                accept_rates_by_position.append(None)
+            else:
+                accept_rates_by_position.append(
+                    aggregate.accepted_at_pos[pos] / denom
+                )
+
+    total_time = aggregate.total_time_sec
+    output_tokens = aggregate.output_token_sum
+    tokens_per_sec = output_tokens / total_time if total_time > 1e-6 else 0.0
+
+    return DatasetMetrics(
+        dataset=dataset,
+        num_samples=aggregate.sample_count,
+        draft_tokens_per_proposal=draft_tokens_per_proposal,
+        acceptance_length=acceptance_length,
+        verify_rate=verify_rate,
+        accept_rates_by_position=accept_rates_by_position,
+        accuracy=accuracy,
+        total_time_sec=total_time,
+        tokens_per_sec=tokens_per_sec,
+        target_time_sec=aggregate.target_time_sec,
+        draft_time_sec=aggregate.draft_time_sec,
+    )
+
+
+def _gather_sample_rows(
+    samples: list[SampleMetrics],
+    world_size: int,
+    total_prompts: int,
+) -> list[SampleMetrics]:
+    """Gather sample metrics on rank 0 and restore original global order."""
+    if world_size <= 1:
+        return samples
+
+    gathered: list[list[SampleMetrics] | None] = [None] * world_size
+    dist.all_gather_object(gathered, samples)
+
+    if dist.get_rank() != 0:
+        return []
+
+    ordered: list[SampleMetrics] = []
+    for global_idx in range(total_prompts):
+        rank = global_idx % world_size
+        local_idx = global_idx // world_size
+        ordered.append(gathered[rank][local_idx])
+    return ordered
+
+
 def summarize_dataset(
     dataset: str,
     samples: list[SampleMetrics],
     labels: Any,
     benchmarker: Any,
     block_size: int,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    total_prompts: int,
 ) -> DatasetMetrics:
-    proposal_lengths = [value for sample in samples for value in sample.proposal_lengths]
-    accepted_lengths = [value for sample in samples for value in sample.accepted_draft_lengths]
-    acceptance_lengths = [value for sample in samples for value in sample.acceptance_lengths]
-    num_output_tokens = sum(sample.num_output_tokens for sample in samples)
-    verify_count = sum(sample.verify_count for sample in samples)
+    aggregate = _aggregate_samples(samples, block_size)
+    aggregate = _all_reduce_aggregate(aggregate, device)
 
-    accept_rates = []
-    for pos in range(block_size):
-        denom = sum(1 for length in proposal_lengths if length > pos)
-        if denom == 0:
-            accept_rates.append(None)
-        else:
-            numer = sum(1 for length in accepted_lengths if length > pos)
-            accept_rates.append(numer / denom)
+    all_samples = samples
+    if labels is not None and benchmarker is not None and world_size > 1:
+        all_samples = _gather_sample_rows(samples, world_size, total_prompts)
 
     accuracy = None
-    if labels is not None and benchmarker is not None:
-        predictions = [benchmarker.extract_answer(sample.output, labels[idx]) for idx, sample in enumerate(samples)]
+    if labels is not None and benchmarker is not None and rank == 0:
+        predictions = [
+            benchmarker.extract_answer(sample.output, labels[idx])
+            for idx, sample in enumerate(all_samples)
+        ]
         accuracy = benchmarker.compute_accuracy(predictions, labels)
 
-    return DatasetMetrics(
-        dataset=dataset,
-        num_samples=len(samples),
-        draft_tokens_per_proposal=(statistics.mean(proposal_lengths) if proposal_lengths else 0.0),
-        acceptance_length=(statistics.mean(acceptance_lengths) if acceptance_lengths else 0.0),
-        verify_rate=(verify_count / max(num_output_tokens, 1)),
-        accept_rates_by_position=accept_rates,
-        accuracy=accuracy,
-    )
+    return _build_dataset_metrics(dataset, aggregate, block_size, accuracy)
+
+
+def _shard_prompts(prompts: list[Any], rank: int, world_size: int) -> list[Any]:
+    if world_size <= 1:
+        return prompts
+    return [prompt for idx, prompt in enumerate(prompts) if idx % world_size == rank]
 
 
 def main() -> None:
     args = parse_args()
+    device, rank, world_size = init_distributed(args.device, args.distributed_backend)
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = resolve_device(args.device)
+
     dtype = resolve_dtype(args.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -690,9 +1072,22 @@ def main() -> None:
         args.draft_model_path,
         torch_dtype=dtype,
         attn_implementation=args.attention_backend,
-        trust_remote_code=True,
+        trust_remote_code=args.trust_remote_code,
     ).to(device).eval()
     draft_model.config._attn_implementation = args.attention_backend
+
+    assert_no_final_target_layer(target_model, draft_model.target_layer_ids)
+    assert 0.0 <= float(args.confidence_threshold) <= 1.0
+
+    confidence_recorder: ConfidenceRecorder | None = None
+    if (
+        draft_model.confidence_head is not None
+        and float(args.confidence_threshold) == 0.0
+    ):
+        confidence_recorder = ConfidenceRecorder(
+            block_size=int(draft_model.block_size),
+            device=device,
+        )
 
     generator = DSparkHFGenerator(
         target_model=target_model,
@@ -701,13 +1096,26 @@ def main() -> None:
         temperature=args.temperature,
         confidence_threshold=args.confidence_threshold,
         max_new_tokens=args.max_new_tokens,
+        confidence_recorder=confidence_recorder,
     )
 
-    results = {"target_model": args.target_model_path, "draft_model": args.draft_model_path, "datasets": []}
+    results = {
+        "target_model": args.target_model_path,
+        "draft_model": args.draft_model_path,
+        "world_size": world_size,
+        "datasets": [],
+    }
+
     for dataset_name, prompts, labels, benchmarker in load_eval_sets(args, tokenizer):
-        print(f"Running {dataset_name} with {len(prompts)} prompts")
+        local_prompts = _shard_prompts(prompts, rank, world_size)
+        if rank == 0:
+            print(
+                f"Running {dataset_name} with {len(prompts)} prompts "
+                f"(local shard {len(local_prompts)} on rank {rank})"
+            )
+
         sample_rows = []
-        for index, prompt_item in enumerate(prompts, start=1):
+        for index, prompt_item in enumerate(local_prompts, start=1):
             if isinstance(prompt_item, dict):
                 prompt = str(prompt_item["prompt"])
                 input_ids = prompt_item["input_ids"]
@@ -717,19 +1125,42 @@ def main() -> None:
             metrics = generator.generate(input_ids, prompt)
             sample_rows.append(metrics)
             print(
-                f"[{dataset_name} {index}/{len(prompts)}] "
+                f"[{dataset_name} r{rank} {index}/{len(local_prompts)}] "
                 f"out={metrics.num_output_tokens} verify={metrics.verify_count} "
-                f"accept_len={(statistics.mean(metrics.acceptance_lengths) if metrics.acceptance_lengths else 0.0):.2f}"
+                f"accept_len={(statistics.mean(metrics.acceptance_lengths) if metrics.acceptance_lengths else 0.0):.2f} "
+                f"time={metrics.total_time_sec:.3f}s"
             )
+
+        if confidence_recorder is not None:
+            confidence_recorder.all_reduce()
+
         summary = summarize_dataset(
-            dataset_name, sample_rows, labels, benchmarker, int(draft_model.block_size)
-        )
-        print(json.dumps(asdict(summary), indent=2, ensure_ascii=False))
-        results["datasets"].append(
-            {"summary": asdict(summary), "samples": [asdict(row) for row in sample_rows]}
+            dataset_name,
+            sample_rows,
+            labels,
+            benchmarker,
+            int(draft_model.block_size),
+            device,
+            rank,
+            world_size,
+            len(prompts),
         )
 
-    if args.output_file:
+        confidence_summary = None
+        if confidence_recorder is not None and rank == 0:
+            confidence_summary = confidence_recorder.compute()
+            confidence_recorder.reset()
+
+        if rank == 0:
+            summary_dict = asdict(summary)
+            if confidence_summary is not None:
+                summary_dict["confidence_calibration"] = confidence_summary
+            print(json.dumps(summary_dict, indent=2, ensure_ascii=False))
+            results["datasets"].append(
+                {"summary": summary_dict, "samples": [asdict(row) for row in sample_rows]}
+            )
+
+    if args.output_file and rank == 0:
         with open(args.output_file, "w", encoding="utf-8") as handle:
             json.dump(results, handle, indent=2, ensure_ascii=False)
         print(f"Results saved to {args.output_file}")
