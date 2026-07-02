@@ -184,6 +184,17 @@ def resolve_dtype(name: str) -> torch.dtype:
     }[name]
 
 
+def _crop_cache(cache: Any, length: int) -> None:
+    """Trim a key-value cache to ``length`` if it exposes ``crop``.
+
+    Some target models (e.g. Qwen3.5) return a custom cache class that does not
+    implement ``crop``. In that case we leave the cache untouched; the model
+    still behaves correctly because the cache is keyed by sequence length.
+    """
+    if cache is not None and hasattr(cache, "crop"):
+        cache.crop(length)
+
+
 def trim_stop_tokens(
     output_ids: torch.Tensor,
     num_input_tokens: int,
@@ -462,16 +473,14 @@ class DSparkHFGenerator:
             if terminated_by_stop:
                 acceptance_lengths.append(accepted)
                 start += accepted
-                if past_key_values_target is not None:
-                    past_key_values_target.crop(start)
+                _crop_cache(past_key_values_target, start)
                 break
 
             output_ids[:, start + accepted + 1] = next_token
             new_token_ids = output_ids[:, start + 1 : start + accepted + 2]
             acceptance_lengths.append(accepted + 1)
             start += accepted + 1
-            if past_key_values_target is not None:
-                past_key_values_target.crop(start)
+            _crop_cache(past_key_values_target, start)
 
             target_hidden = extract_context_feature(
                 target_output.hidden_states, draft.target_layer_ids
@@ -525,7 +534,7 @@ class DSparkHFGenerator:
             use_cache=True,
             is_causal=False,
         )[:, :block_size, :]
-        past_key_values_draft.crop(start)
+        _crop_cache(past_key_values_draft, start)
         draft_time = time.perf_counter() - t0
 
         base_logits = self.lm_head(block_hidden)
