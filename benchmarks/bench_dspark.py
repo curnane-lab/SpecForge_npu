@@ -530,17 +530,25 @@ class DSparkHFGenerator:
         draft_input_ids[:, 0] = output_ids[:, start]
         noise_embedding = self.embed_tokens(draft_input_ids).to(dtype=target_hidden.dtype)
 
+        # The draft attends to target_hidden (context) plus the noise block.
+        # Pass absolute positions for both so RoPE is applied consistently with
+        # DFlash training, which uses full_position_ids = context + draft.
+        ctx_len = target_hidden.shape[1]
+        context_positions = torch.arange(
+            start - ctx_len, start, device=output_ids.device
+        ).unsqueeze(0)
+        draft_positions = position_ids[:, start : start + block_size]
+        full_position_ids = torch.cat([context_positions, draft_positions], dim=1)
+
         t0 = time.perf_counter()
         block_hidden = draft(
             target_hidden=target_hidden,
             noise_embedding=noise_embedding,
-            position_ids=position_ids[
-                :, past_key_values_draft.get_seq_length() : start + block_size
-            ],
+            position_ids=full_position_ids,
             past_key_values=past_key_values_draft,
             use_cache=True,
             is_causal=False,
-        )[:, :block_size, :]
+        )
         _crop_cache(past_key_values_draft, start)
         draft_time = time.perf_counter() - t0
 
