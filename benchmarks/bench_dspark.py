@@ -920,9 +920,11 @@ def _all_reduce_aggregate(aggregate: _DatasetAggregate, device: torch.device) ->
         dtype=torch.int64,
         device=device,
     )
+    # NPU collectives do not support float64; mirror ConfidenceRecorder logic.
+    time_dtype = torch.float32 if device.type == "npu" else torch.float64
     float_scalar = torch.tensor(
         [aggregate.total_time_sec, aggregate.target_time_sec, aggregate.draft_time_sec],
-        dtype=torch.float64,
+        dtype=time_dtype,
         device=device,
     )
     pos_counts = torch.tensor(
